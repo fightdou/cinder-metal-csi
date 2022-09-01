@@ -1,190 +1,258 @@
 # cinder-metal-csi
 
-The Cinder CSI Driver is a CSI Specification compliant driver used by Container Orchestrators to manage the lifecycle of OpenStack Cinder Volumes.
+## 介绍
 
-## Overview
+- cinder-metal-csi 是 kubernetes 中的一个 csi 存储插件，可以为kubernetes集群提供多个存储后端，让 kubernetes 更加简单、灵活的去使用 openstack 的存储服务。
+- cinder-metal-csi 支持 noauth、keystone 两种认证方式，使用 noauth 认证方式进行部署，只需部署 openstack cinder 服务即可，无需部署 openstack 其他组件。
 
-The Cinder Metal CSI driver let openstack create cinder volume, map to the host, become the host a block device, and mount the block device
-to the pod.
+### 架构
 
-<img src="cinder-csi.png" alt="cinder-csi"/>
+<img src="architecture.png" alt="cinder-metal-csi"/>
 
-## Driver Deployment
+## 部署
 
-You can either use the manifests under manifests file to deploy the cinder metal csi driver.
+### 准备工作
 
-### Command-line arguments
+*前提条件：已部署 kubernetes 集群*
 
-cinder-metal-csi accepts the following command-line arguments:
+如何快速在 k8s 集群搭建一个 openstack cinder 环境，如下所示：
 
-- --nodeid <nodeid>
-    - The kubernetes node IP.
-- --endpoint <endpoint>
-    - The endpoint of the gRPC server agents will use to connect to this CSI plugin, typically a local unix socket.
-    - The manifests default this to unix:///csi/csi.sock, which is supplied via the CSI_ENDPOINT environment variable.
-- --cloud-config <config file>
-    - The path to a driver config file. The format of this file is specified in Driver Config.
-    - The manifests default this to /etc/config/cloud.conf, which is supplied via the CLOUD_CONFIG environment variable.
-
-## Driver Config
-
-For Driver configuration, parameters must be passed via configuration file specified in `$CLOUD_CONFIG` environment variable.
-The following sections are supported in configuration file.
-
-### Global
-
-- username Keystone username. If you are using Keystone application credential, this option is not required.
-- password Keystone user password. If you are using Keystone application credential, this option is not required.
-- user-domain-name Keystone user domain name.
-- project-domain-name Keystone project domain name.
-- tenant-name Keystone project name.
-- auth-url Keystone service URL.
-- region Keystone region name.
-- endpoint-type Specify which type of endpoint to use from the service catalog. If not set, public endpoints are used.
-
-### BlockStorage
-
-- auth-strategy Auth strategy. Support keystone and noauth mode.
-- cinder-listen-addr Noauth mode config the cinder service listen addr.
-- node-volume-attach-limit To configure maximum volumes that can be attached to the node. Its default value is 256
-- lvm-volume-type The lvm volume type name, default lvm. Consistent with the type parameters in the dynamic storage class.
-- ceph-volume-type  The ceph volume type name, default rbd. Consistent with the type parameters in the dynamic storage class.
-- local-volume-type  The local volume type name, default local. Consistent with the type parameters in the dynamic storage class.
-
-### Use the manifests
-
-All the manifests required for the deployment of the plugin are found at ```manifests/```
-
-Configuration file specified in `$CLOUD_CONFIG` is passed to cinder CSI driver via kubernetes `secret`.
-
-To create a secret:
-
-* Encode your `$ClOUD_CONFIG` file content using base64.
-
-`$ base64 -w 0 $CLOUD_CONFIG`
-
-* Update ```cloud.conf``` configuration in ```manifests/csi-secret-cinderplugin.yaml``` file by using the result of the above command.
-
-* Create the secret.
-
-``` $ kubectl create -f manifests/csi-secret-cinderplugin.yaml```
-
-* If the cinder backend storage type is ceph, you need to config ceph config file and ceph keyring file.
-
-* Encode your `$CEPH_CONFIG` file content using base64.
-
-  `$ base64 -w 0 $CEPH_CONFIG`
-
-* Update ```ceph.conf``` configuration in ```manifests/cinder-config.yaml``` file by using the result of the above command.
-* Create the configmap.
-
-  ``` $ kubectl create -f manifests/cinder-config.yaml```
-
-* Encode your `$CEPH_ADMIN_KEYRING` file content using base64.
-
-  `$ base64 -w 0 $CEPH_ADMIN_KEYRING`
-
-* Update ```key``` configuration in ```manifests/cinder-volume-rbd-keyring.yaml``` file by using the result of the above command.
-* Create the Secrets.
-
-  ``` $ kubectl create -f manifests/cinder-volume-rbd-keyring.yaml```
-
-Once the secret is created, Controller Plugin and Node Plugins can be deployed using respective manifests.
-
-```$ kubectl -f manifests/ apply```
-
-This creates a set of cluster roles, cluster role bindings, and statefulsets etc to communicate with openstack(cinder).
-For detailed list of created objects, explore the yaml files in the directory.
-You should make sure following similar pods are ready before proceed:
-
-```
-$ kubectl get pods -n kube-system
-NAME                                                  READY   STATUS    RESTARTS         AGE
-cinder-metal-csi-controller-plugin-7ff586b8f5-fvb88   6/6     Running   0                2d22h
-cinder-metal-csi-nodeplugin-58mwv                     4/4     Running   0                2d22h
+```BASH
+kubectl create namespace openstack
+helm repo add kungze https://charts.kungze.net
+helm install openstack-password kungze/password --namespace openstack
+helm install openstack-dependency kungze/openstack-dep --namespace openstack --set ceph.enabled=false --set mariadb.primary.persistence.enabled=false --set rabbitmq.persistence.enabled=false
+helm install openstack-keystone kungze/keystone --namespace openstack
+helm install openstack-cinder kungze/cinder --namespace openstack --set ceph.enabled=false --set lvm.loop_device_size=51200
 ```
 
-To get information about CSI Drivers running in a cluster
+查看安装进度，等待 pod 状态都变成 running，说明服务都正常启动了（可能有些pod的状态为 Init:Error，不用担心，这是一个正常状态）
 
-```
-kubectl get csidrivers.storage.k8s.io
-NAME                            ATTACHREQUIRED   PODINFOONMOUNT   STORAGECAPACITY   TOKENREQUESTS   REQUIRESREPUBLISH   MODES        AGE
-cinder.metal.csi                true             true             false             <unset>         false               Persistent   2d22h
+```BASH
+watch -n 1 kubectl -n openstack get pods
 ```
 
-## Cinder CSI Driver Usage Examples
+创建 openstackrc 文件去执行 openstack 或 cinder 命令
 
-### Dynamic Volume Provisioning
-
-For dynamic provisoning , create StorageClass, PersistentVolumeClaim and pod to consume it.
-Checkout [rbd volume](https://github.com/kungze/cinder-metal-csi/blob/manifests/example/nginx-rbd.yaml) definition fore reference.
-
-Notes: Add the type parameter to create the storage class.
-
-```shell
-kubectl apply -f example/nginx-rbd.yaml
+```BASH
+echo "
+export OS_USERNAME=$(kubectl get secret -n openstack openstack-keystone -o jsonpath="{.data.OS_USERNAME}" | base64 --decode)
+export OS_PROJECT_DOMAIN_NAME=$(kubectl get secret -n openstack openstack-keystone -o jsonpath="{.data.OS_PROJECT_DOMAIN_NAME}" | base64 --decode)
+export OS_USER_DOMAIN_NAME=$(kubectl get secret -n openstack openstack-keystone -o jsonpath="{.data.OS_USER_DOMAIN_NAME}" | base64 --decode)
+export OS_PROJECT_NAME=$(kubectl get secret -n openstack openstack-keystone -o jsonpath="{.data.OS_PROJECT_NAME}" | base64 --decode)
+export OS_REGION_NAME=$(kubectl get secret -n openstack openstack-keystone -o jsonpath="{.data.OS_REGION_NAME}" | base64 --decode)
+export OS_PASSWORD=$(kubectl get secrets -n openstack openstack-password -o jsonpath="{.data.keystone-admin-password}" | base64 --decode)
+export OS_AUTH_URL=$(kubectl get secret -n openstack openstack-keystone -o jsonpath="{.data.OS_CLUSTER_URL}" | base64 --decode)
+export OS_INTERFACE=internal
+" > openstackrc
+source openstackrc
 ```
 
-View the PVC status, Check the pvc is in Bound state which claims one volume from cinder
+上述命令部署 openstack 集群仅用于准备实验环境。不要在生产环境中使用它。如果需要在生产环境中使用 cinder-metal-csi，建议使用 openstack [kolla-ansible](https://github.com/openstack/kolla-ansible) 部署稳定的openstack集群。
 
-```
-$ kubectl get pvc
-NAME                            STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS           AGE
-cinder-pvc-rbd                  Bound    pvc-444feb52-3e38-4a7f-962f-0f23de10b7a9   2Gi        RWO            cinder-metal-csi-rbd   3s
+### 为 cinder-metal-csi 创建单独的 openstack 租户
 
-$ cinder list
-+--------------------------------------+-----------+------------------------------------------+------+-------------+----------+-------------+
-| ID                                   | Status    | Name                                     | Size | Volume Type | Bootable | Attached to |
-+--------------------------------------+-----------+------------------------------------------+------+-------------+----------+-------------+
-| fcb80e1b-5525-4bea-a552-443f73a97ca1 | in-use    | pvc-444feb52-3e38-4a7f-962f-0f23de10b7a9 | 2    | rbd         | false    | None        |
-+--------------------------------------+-----------+------------------------------------------+------+-------------+----------+-------------+
-
-```
-
-To Check the volume created and attached to the pod
-
-```
-$ ls /dev/rbd2
-/dev/rbd2
-
-$ mount |grep rbd2
-/dev/rbd2 on /var/lib/kubelet/plugins/kubernetes.io/csi/pv/pvc-444feb52-3e38-4a7f-962f-0f23de10b7a9/globalmount type ext4 (rw,relatime,stripe=16)
-/dev/rbd2 on /var/lib/kubelet/pods/4a9dae22-2e0f-4813-aaea-4376d934d3c7/volumes/kubernetes.io~csi/pvc-444feb52-3e38-4a7f-962f-0f23de10b7a9/mount type ext4 (rw,relatime,stripe=16)
-```
-
-Then try to add a file in the pod's mounted position (in our case, /var/lib/www/html)
-
-```shell
-$ kubectl exec -it nginx-rbd bash
-kubectl exec [POD] [COMMAND] is DEPRECATED and will be removed in a future version. Use kubectl exec [POD] -- [COMMAND] instead.
-root@nginx-rbd:/# df -Th
-Filesystem     Type     Size  Used Avail Use% Mounted on
-overlay        overlay  549G   29G  499G   6% /
-tmpfs          tmpfs     64M     0   64M   0% /dev
-tmpfs          tmpfs    252G     0  252G   0% /sys/fs/cgroup
-/dev/sdx1      ext4     549G   29G  499G   6% /etc/hosts
-shm            tmpfs     64M     0   64M   0% /dev/shm
-/dev/rbd2      ext4     2.0G   24K  1.9G   1% /var/lib/www/html
-tmpfs          tmpfs    504G   12K  504G   1% /run/secrets/kubernetes.io/serviceaccount
-tmpfs          tmpfs    252G     0  252G   0% /proc/acpi
-tmpfs          tmpfs    252G     0  252G   0% /proc/scsi
-tmpfs          tmpfs    252G     0  252G   0% /sys/firmware
-
-root@nginx-rbd:/# touch /var/lib/www/html/index.html
-root@nginx-rbd:/# exit
+```BASH
+openstack project create kubernetes
++-------------+----------------------------------+
+| Field       | Value                            |
++-------------+----------------------------------+
+| description |                                  |
+| domain_id   | default                          |
+| enabled     | True                             |
+| id          | d74063d003c94ed7aa891434d1527ee6 |
+| is_domain   | False                            |
+| name        | kubernetes                       |
+| options     | {}                               |
+| parent_id   | default                          |
+| tags        | []                               |
++-------------+----------------------------------+
+# openstack user create --project kubernetes --password ChangeMe kubernetes
++---------------------+----------------------------------+
+| Field               | Value                            |
++---------------------+----------------------------------+
+| default_project_id  | d74063d003c94ed7aa891434d1527ee6 |
+| domain_id           | default                          |
+| enabled             | True                             |
+| id                  | e40376719a7544a995e179f57d61c259 |
+| name                | kubernetes                       |
+| options             | {}                               |
+| password_expires_at | None                             |
++---------------------+----------------------------------+
+# openstack role add --project kubernetes --user kubernetes member
 ```
 
-Next, make sure the pod is deleted so that the persistent volume will be freed
+### 准备配置文件
 
-```shell
-$ kubectl delete pod nginx-rbd
+为了让 cinder-metal-csi 可以连接到 openstack cinder 服务，需要在 kubernetes集群中创建 openstack 认证 secrets
 
-$ cinder list
-+--------------------------------------+-----------+------------------------------------------+------+-------------+----------+-------------+
-| ID                                   | Status    | Name                                     | Size | Volume Type | Bootable | Attached to |
-+--------------------------------------+-----------+------------------------------------------+------+-------------+----------+-------------+
-| fcb80e1b-5525-4bea-a552-443f73a97ca1 | available | pvc-444feb52-3e38-4a7f-962f-0f23de10b7a9 | 2    | rbd         | false    |             |
-+--------------------------------------+-----------+------------------------------------------+------+-------------+----------+-------------+
+```BASH
+kind: Secret
+apiVersion: v1
+metadata:
+  name: cinder-metal-csi-config
+  namespace: kube-system
+stringData:
+  cloud.conf: |
+    [Global]
+    username = kubernetes
+    password = ChangeMe
+    user-domain-name = default
+    project-domain-name = default
+    project-name = kubernetes
+    tenant-name = kubernetes
+    # Replace this value with correct keystone url
+    auth-url = http://keystone-api.openstack.svc.cluster.local:5000/v3
+    region = RegionOne
+    endpoint-type = internal
 
+    [BlockStorage]
+    # The value is same with cinder's configuration
+    auth-strategy = keystone
+    node-volume-attach-limit = 110
+```
+
+*注意： 将 cloud.conf 文件中的值替换为你的环境中的配置*
+
+为 ceph volumes pool 创建 secrets
+
+如果你的 openstack 环境支持使用 ceph rbd 作为cinder的后端。您需要在 k8s 的 secrets 中提供 `ceph client user` 和 `ceph keyring`，以便 cinder-metal-csi 能够正确访问 cinder volume rbd池。
+
+```BASH
+kind: Secret
+apiVersion: v1
+metadata:
+  name: cinder-metal-csi-rbd
+  namespace: kube-system
+stringData:
+  cephClientUser: cinder
+  cephClientKey: AQATNwxjHYRXEhAAECkdgAV+Q1mhZRztWh0c2Q==
+type: Opaque
+```
+
+*注意： 将 cephClientUser 和 cephClientKey 替换为你的环境中的配置*
+
+## 部署 cinder-metal-csi
+
+```BASH
+kubectl apply -f https://raw.githubusercontent.com/kungze/cinder-metal-csi/main/manifests/cinder-metal-csi-controllerplugin-rbac.yaml
+kubectl apply -f https://raw.githubusercontent.com/kungze/cinder-metal-csi/main/manifests/cinder-metal-csi-controllerplugin.yaml
+kubectl apply -f https://raw.githubusercontent.com/kungze/cinder-metal-csi/main/manifests/cinder-metal-csi-nodeplugin-rbac.yaml
+kubectl apply -f https://raw.githubusercontent.com/kungze/cinder-metal-csi/main/manifests/cinder-metal-csi-nodeplugin.yaml
+```
+
+创建 StorageClass 和 CSIDriver
+
+- CSIDriver
+
+```BASH
+kubectl apply -f https://raw.githubusercontent.com/kungze/cinder-metal-csi/main/manifests/cinder-metal-csi-driver.yaml
+```
+
+- StorageClass
+
+目前的 cinder-metal-csi 插件只支持两种连接协议来连接 cinder 后端: rbd 和 iscsi，未来，我们将支持 cinder 所支持的所有连接协议。
+我们建议在创建 k8s 的 storageclass 时，一个 storageclass 对应一种 openstack cinder 的卷类型，使用以下命令查看 openstack 集群的卷类型
+
+```BASH
+cinder type-list
++--------------------------------------+-------------+---------------------+-----------+
+| ID                                   | Name        | Description         | Is_Public |
++--------------------------------------+-------------+---------------------+-----------+
+| 879821e3-b45d-41b1-8e2d-6c15cc45bdf2 | __DEFAULT__ | Default Volume Type | True      |
+| 8a8ea19d-8a44-442c-9076-e3b670e4600e | lvm         | -                   | True      |
+| f6339aa8-c2de-41eb-b79d-62d7af12ffd6 | rbd         | -                   | True      |
++--------------------------------------+-------------+---------------------+-----------+
+```
+
+对于 iscsi 存储后端的卷，假如 cinder volume type 为 lvm，他在 cinder 中的配置如下所示：
+
+```BASH
+[lvm]
+volume_group = cinder-volumes
+volume_driver = cinder.volume.drivers.lvm.LVMVolumeDriver
+volume_backend_name = lvm
+target_helper = tgtadm
+target_protocol = iscsi
+```
+
+与此相对应的 StorageClass 配置如下所示：
+
+```BASH
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cinder-metal-csi-lvm
+  namespace: kube-system
+provisioner: cinder.metal.csi
+parameters:
+  cinderVolumeType: lvm
+```
+
+*注意： 将 cinderVolumeType 和 cinder lvm 的卷类型保持一致*
+
+对于 rbd 类型的卷，它在 cinder 后端的配置如下：
+
+```BASH
+[rbd]
+volume_driver = cinder.volume.drivers.rbd.RBDDriver
+volume_backend_name = rbd
+rbd_pool = volumes
+rbd_ceph_conf = /etc/ceph/ceph.conf
+rbd_flatten_volume_from_snapshot = false
+rbd_max_clone_depth = 5
+rbd_store_chunk_size = 4
+rados_connect_timeout = 5
+rbd_secret_uuid = c9c17395-0186-4788-b73b-6d00b84a1c1b
+report_discard_supported = True
+image_upload_use_cinder_backend = False
+```
+
+*注意：无须配置 rbd_keyring_conf 和 rbd_user*
+
+与此相对应的 StorageClass 配置如下所示：
+
+```BASH
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cinder-metal-csi-rbd
+  namespace: kube-system
+provisioner: cinder.metal.csi
+parameters:
+  cinderVolumeType: rbd
+  csi.storage.k8s.io/node-stage-secret-name: cinder-metal-csi-rbd
+  csi.storage.k8s.io/node-stage-secret-namespace: kube-system
+```
+
+StorageClass 中的参数 csi.storage.k8s.io/node-stage-secret-name 和 csi.storage.k8s.io/node-stage-secret-namespace 是为 cinder-metal-csi 使用 cinder volume rbd pool 提供认证信息。
+
+## 测试
+
+通过以下命令创建 pod 测试
+
+```BASH
+kubectl apply -f https://raw.githubusercontent.com/kungze/cinder-metal-csi/main/example/nginx-lvm.yaml
+kubectl apply -f https://raw.githubusercontent.com/kungze/cinder-metal-csi/main/example/nginx-rbd.yaml
+```
+
+查看 pvc 的状态
+
+```BASH
+# kubectl get pvc|grep cinder
+cinder-pvc-lvm                               Bound    pvc-97e74caa-ab3a-4003-a8d9-b2f27c483eca   2Gi        RWO            cinder-metal-csi-lvm   2m22s
+cinder-pvc-rbd                               Bound    pvc-00dee4fb-d976-4819-a601-19edee0563bc   2Gi        RWO            cinder-metal-csi-rbd   2m18s
+```
+
+检查上面 pvc 相关的 cinder volume
+
+```BASH
+# cinder list
++--------------------------------------+----------------------------------+--------+------------------------------------------+------+----------------+-------------+----------+--------------------------------------+
+| ID                                   | Tenant ID                        | Status | Name                                     | Size | Consumes Quota | Volume Type | Bootable | Attached to                          |
++--------------------------------------+----------------------------------+--------+------------------------------------------+------+----------------+-------------+----------+--------------------------------------+
+| 76c75b7b-0f68-4c63-9b63-f1aa61ba53aa | d74063d003c94ed7aa891434d1527ee6 | in-use | pvc-00dee4fb-d976-4819-a601-19edee0563bc | 2    | True           | rbd         | false    | cf4a06c0-595e-4bf7-bc77-cf489b37a5ee |
+| 9f2e11f2-c0cc-4628-91d5-438860f5affe | d74063d003c94ed7aa891434d1527ee6 | in-use | pvc-97e74caa-ab3a-4003-a8d9-b2f27c483eca | 2    | True           | lvm         | false    | 26c043f9-ee4f-4dc7-9f00-c4dff72461c9 |
++--------------------------------------+----------------------------------+--------+------------------------------------------+------+----------------+-------------+----------+--------------------------------------+
 ```
 
